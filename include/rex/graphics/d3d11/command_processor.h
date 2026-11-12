@@ -280,6 +280,23 @@ class D3D11CommandProcessor : public CommandProcessor {
   uint64_t resolve_refresh_swap_mark_ = 0;
   uint64_t resolve_refresh_swap_bytes_ = 0;
   bool resolve_refresh_failed_logged_ = false;
+  // Refresh wait batching: the GPU wait in RefreshResolvedGuestRange is the
+  // refresh path's serialisation point, and a swap's texture loads ask for
+  // several GPU-written ranges (base + mips, then the next texture) that the
+  // same resolves produced. Once a wait has drained the GPU, a later refresh
+  // for a range no newer resolve has written needs no second wait - the
+  // mirror data it reads was already final when the last wait returned, and
+  // the readback's own Map orders the copy after it. So a refresh skips the
+  // wait (and the tape replay, which only matters when a resolve landed)
+  // when resolve_call_count_ is unchanged since the last refresh wait.
+  // refresh_waited_resolve_count_ is the resolve count at that wait.
+  uint64_t refresh_waited_resolve_count_ = 0;
+  bool refresh_waited_ = false;
+  // Refresh wait cost: time in WaitForGpu for refreshes, and how many waits
+  // the batching skipped vs performed. Logged with the periodic refresh line.
+  uint64_t refresh_wait_ticks_ = 0;
+  uint64_t refresh_waits_done_ = 0;
+  uint64_t refresh_waits_skipped_ = 0;
   // fh1_debug_surface_dump fires once per session.
   bool surface_dump_done_ = false;
   // fh1_debug_presented_pair dumps this many consecutive swaps from its start.

@@ -4047,11 +4047,32 @@ bool D3D11CommandProcessor::RefreshResolvedGuestRange(uint32_t start, uint32_t l
   // fences, so the completion point is the swap's own wait. Recorded resolve
   // work is replayed first (a safety net: submission happens at the resolve
   // boundary, so the tape is normally empty here).
-  if (command_lists_enabled_) {
-    SubmitFrameTape("resolved range refresh");
-  }
-  if (!WaitForGpu()) {
-    return false;
+  //
+  // Wait batching: a swap's texture loads ask for several GPU-written ranges
+  // that the same resolves produced, and each one used to pay a full GPU wait
+  // here. Once a wait has drained the GPU, a later refresh for a range no
+  // newer resolve has written needs no second wait - the mirror data it reads
+  // was already final when the last wait returned, and the readback's own Map
+  // orders the copy after it. The resolve count is the signal: it only moves
+  // when a resolve lands (and marks pages GPU-written), so an unchanged count
+  // means no new mirror data exists. Skips the tape replay too - it only
+  // matters when a resolve landed, and the tape was flushed by that wait.
+  const bool refresh_wait_ready =
+      refresh_waited_ && refresh_waited_resolve_count_ == resolve_call_count_;
+  if (refresh_wait_ready) {
+    ++refresh_waits_skipped_;
+  } else {
+    if (command_lists_enabled_) {
+      SubmitFrameTape("resolved range refresh");
+    }
+    const uint64_t refresh_wait_start = rex::chrono::Clock::QueryHostTickCount();
+    if (!WaitForGpu()) {
+      return false;
+    }
+    refresh_wait_ticks_ += rex::chrono::Clock::QueryHostTickCount() - refresh_wait_start;
+    ++refresh_waits_done_;
+    refresh_waited_ = true;
+    refresh_waited_resolve_count_ = resolve_call_count_;
   }
   resolve_readback_scratch_.resize(length);
   if (!upload_sink->ReadbackFromHostBuffer(start, resolve_readback_scratch_.data(), length)) {
@@ -4196,6 +4217,13 @@ void D3D11CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             (resolve_refresh_bytes_ - resolve_refresh_swap_bytes_) >> 20);
         resolve_refresh_swap_mark_ = resolve_refresh_count_;
         resolve_refresh_swap_bytes_ = resolve_refresh_bytes_;
+        const double refresh_wait_ms = double(refresh_wait_ticks_) * 1000.0 /
+                                       double(rex::chrono::Clock::QueryHostTickFrequency());
+        REXGPU_INFO(
+            "D3D11 FH1 resolve refresh waits: {} done, {} skipped, {:.1f} ms total "
+            "({:.3f} ms mean per wait)",
+            refresh_waits_done_, refresh_waits_skipped_, refresh_wait_ms,
+            refresh_waits_done_ ? refresh_wait_ms / double(refresh_waits_done_) : 0.0);
       }
       // Phase 3 M3: the tape's accounting, on the same periodic beat (a render-
       // test run is usually stopped before a clean shutdown, and the draw
