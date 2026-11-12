@@ -188,6 +188,9 @@ class D3D11TextureCache final : public TextureCache {
   // RequestSwapTexture explains the first failed frontbuffer request once.
   bool swap_request_logged_ = false;
   uint32_t swap_fail_logs_ = 0;
+  // Set while LoadTextureData uploads the presented swap texture: its red and
+  // blue ten-bit fields are exchanged back (see the upload's note).
+  bool swap_red_blue_upload_ = false;
   uint64_t unsupported_format_mask_logged_ = 0;
   uint32_t texture_uploads_logged_ = 0;
   uint64_t texture_upload_count_ = 0;

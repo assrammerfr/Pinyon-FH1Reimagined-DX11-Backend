@@ -680,6 +680,36 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       slice_info.convert = host_format.convert;
       texture_conversion::CopyGuestLevelSlice(slice_info);
 
+      // The guest asks the resolve that writes its front buffer to exchange red
+      // and blue (its copy info's swap bit), and this backend honours that, so
+      // the presented frame's words hold their channels the other way round.
+      // The swap texture is uploaded from exactly those words and painted
+      // as-is, which is how a warm Colorado sunset has been reaching the screen
+      // neon blue. Exchange the ten-bit fields back here, on the presented
+      // upload only, so the presenter samples the frame's own channel order -
+      // the same bits, red and blue the right way round. The depth value at
+      // bits 30-31 is untouched.
+      const bool swap_words_are_10_10_10_2 =
+          host_format.dxgi_format_resource == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
+          host_format.dxgi_format_resource == DXGI_FORMAT_R10G10B10A2_UNORM;
+      if (swap_red_blue_upload_ && swap_words_are_10_10_10_2) {
+        static uint32_t swap_upload_logs = 0;
+        if (swap_upload_logs < 2) {
+          ++swap_upload_logs;
+          REXGPU_INFO(
+              "FH1 swap upload: exchanged red/blue in the {}x{} presented level "
+              "(guest format {})",
+              level_width, level_height, uint32_t(key.format));
+        }
+        auto* words = reinterpret_cast<uint32_t*>(staging_.data());
+        const size_t word_count = staging_.size() / sizeof(uint32_t);
+        for (size_t word = 0; word < word_count; ++word) {
+          const uint32_t value = words[word];
+          words[word] = ((value & 0x000003FFu) << 20) | (value & 0x000FFC00u) |
+                        ((value >> 20) & 0x000003FFu) | (value & 0xC0000000u);
+        }
+      }
+
       // Phase 3 M3: while a draw's RequestTextures is running, the upload is a
       // packet on the command tape - the CPU untiling above still happens here,
       // the GPU write happens at replay, before the draw that samples it. The
@@ -776,7 +806,11 @@ ID3D11ShaderResourceView* D3D11TextureCache::RequestSwapTexture(xenos::TextureFo
   // cached texture is frozen at its first upload.
   shared_memory().MemoryInvalidationCallback(uint32_t(key.base_page) << 12,
                                              uint32_t(texture->GetGuestBaseSize()), true);
+  // The presented upload is the one whose red and blue fields need exchanging
+  // (see the upload's note); every other texture keeps its own channel order.
+  swap_red_blue_upload_ = true;
   const bool swap_upload_ok = LoadTextureData(*texture);
+  swap_red_blue_upload_ = false;
   if (REXCVAR_GET(fh1_swap_fetch_trace)) {
     static uint32_t swap_upload_logs = 0;
     if (!(++swap_upload_logs % 120) && !load_scratch_base_.empty()) {
@@ -819,6 +853,7 @@ ID3D11ShaderResourceView* D3D11TextureCache::RequestSwapTexture(xenos::TextureFo
   height_out = key.GetHeight();
   // The caller holds the view until the swap has drawn with it - the cache may
   // otherwise evict the texture (the view keeps the resource alive).
+  //
   texture->srv()->AddRef();
   return texture->srv();
 }

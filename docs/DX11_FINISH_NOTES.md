@@ -1,5 +1,129 @@
 # DX11 Finish — running state (update at EVERY step boundary)
 
+## PHASE 19 — 2026-11-13: THE NEON BLUE WAS OUR OWN PRESENTED UPLOAD; THE RESOLVE WAS RIGHT TO HONOUR THE SWAP BIT
+
+WHAT THE TRACE SHOWED. The presenting resolve is `dest_info=000E0041` at `dest_base=1BDB1000`
+(extent `1BDB1000+3768320`; the same family also writes `1DAC5000` and `14085000`), i.e. **bit 6 set** —
+the guest's copy info asks for a red/blue exchange, which is what `fh1_edram_resolve.cpp:156` packs and
+`fh1_native_resolve_memory.cs.hlsl:272` performs (`color = color.bgra`). Honouring it leaves the front
+buffer's words in the guest's display order. The only consumer of those words here is the swap texture
+upload: it reads them, converts the guest's 8_8_8_8 to a host `R10G10B10A2_TYPELESS` (`stored_fmt=23`,
+`read_fmt=24`, guest format 7, 1280x720) and the presenter samples that as RGB. Nothing on that leg
+exchanged them back, so the screen got the frame with red and blue swapped: warm sunset gold rendered
+neon blue.
+
+TWO ATTEMPTS THAT DID NOT WORK (not shipped):
+- Clearing `dest_info` bit 6 in the resolve for "the copy whose destination extent is the swap extent"
+  never fired. Instrumented first three bit-6 resolves proved why: at resolve time
+  `GetSwapGuestExtent` returns **false** (`swap=false 00000000+0` - the swap texture does not exist yet),
+  and the front buffer is triple-buffered, so no equality or overlap test against the fetch can work
+  there. Removed.
+- Sampling the presented texture through a `B10G10R10A2_UNORM` view: that DXGI format does not exist in
+  this toolchain (mingw `dxgiformat.h` has `R10G10B10A2_TYPELESS/UNORM = 0x17/0x18` only). Not invented;
+  dropped, and the header include reverted.
+
+THE FIX (texture_cache.cpp/.h): `RequestSwapTexture` sets `swap_red_blue_upload_` around the presented
+`LoadTextureData`; in the upload, when the host format is `R10G10B10A2_TYPELESS`/`UNORM`, each staging
+word has its ten-bit red and blue fields exchanged (`bits 0-9 <-> 20-29`, `bits 30-31` untouched) before
+`UpdateSubresource`. One pass over 1280x720 words per swap; every other texture keeps its own channel
+order. One log line: `FH1 swap upload: exchanged red/blue in the 1280x720 presented level (guest format 7)`.
+
+MEASURED (seed `fb1201-roam2.state`, shipped defaults, no environment cvars except the pair dump):
+
+| swap | meanR | meanG | meanB |
+|---|---|---|---|
+| 340 | 206.4 | 93.3 | 76.0 |
+| 341 | 206.6 | 96.7 | 79.2 |
+
+Before the fix the same two swaps measured 85.8/107.8/206.8 and 86.5/108.7/206.8 — an exact mirror. Viewed
+`.local/diag/view-gold-340.png` and `-341.png`: gold-red sunset sky, sun glare upper right, trees and snow
+in warm light, `stage=swap_texture nz=[1.000 x12]`, all rows 0..720 populated (bandprof rows 0-59..600-659
+`nz=1.000`). The user then looked at the shipped build on their own display: the world that was blue is now
+warm (sunset road, autumn trees); the remaining red cast in their phone photo was not measurable from a
+monitor photograph and is not claimed as verified colour accuracy — what is verified is that red and blue
+are no longer exchanged.
+
+BASELINE CHANGE, STATED EXPLICITLY: `trace-short` on defaults now yields
+**`ecbaba8373e34007042cb5503be2d20f`** (t0300) and **`45296fb46c00aff2d7e150e30472ad3e`** (t0600),
+replacing PHASE 18's `bdbf372199a1b862e4a164fe9ff5c8d8` / `ea61676d771c30b1d12571fccde41298`. Reason: the
+fix exchanges red and blue in every presented pixel, so the presented frames' checksums must change;
+nothing else in that path was touched.
+
+GATES on these defaults (verbatim):
+- `PASS d3d11-draws (d3d11-draws-20261112T101830Z): draw_calls=51178, presented title frame; captures
+  draws-frame [0-255]`, GATE_EXIT=0 (re-run alone; the first attempt in the pack aborted with "render test
+  did not configure and complete exactly once" because a run was already in flight).
+- `PASS d3d11-texture-uploads (d3d11-texture-uploads-20261112T101532Z): draw_calls=51066, uploads 24000 over
+  1055 frames (22.75/frame)`; captures cleared-frame [0-255], GATE_EXIT=0.
+- **FAIL d3d11-cleared-frames: present cadence 15.10 Hz below 30.0**, GATE_EXIT=1 — unchanged from PHASE 18
+  (14.85 Hz); the refresh path still waits for the GPU and reads back per load.
+- **FAIL d3d11-native-resolve-path: no resolve tally in the runtime log**, GATE_EXIT=1 — same as PHASE 18:
+  the run ends on the scenario's timer without emitting the shutdown tally, so the gate has no evidence
+  rather than a wrong number.
+
+NOT DONE HERE: the 1CA95000 black-band probe (draw 12 sampling the 640x360 resolve) is the next job and was
+not started in this phase.
+
+## PHASE 18 — 2026-11-13: THE BAND IS GONE IN THE SHIPPED BUILD. THE PRESENTATION DEFAULTS WERE THE SWITCH.
+
+WHAT WAS ACTUALLY SHIPPING: three gates were default-off, and together they decided that the game
+presents the CPU's last frame instead of its own:
+  `fh1_native_executor = 0`, `fh1_d3d11_resolve_readback = false`, `fh1_resolve_guest_refresh = false`.
+With readback off, the swap's untiling upload shows "the last frame the CPU wrote there" - on a
+cold boot that is the 2012 Turn 10 / Microsoft legal notice, which is exactly what a player sees
+when they launch the build and what the earlier captures recorded as the frozen mean-33.453 frame.
+So the thing that looked like a masked legal notice WAS the shutdown default: the game was never
+presenting its own frames on the shipped path, and every no-band/bad-band measurement of the
+composite was being taken on runs where the executor trio was forced on by environment variables.
+
+CHANGE (src/graphics/flags.cpp, backup flags.cpp.musebak-20261113-present):
+  fh1_native_executor 0 -> 1, fh1_d3d11_resolve_readback false -> true,
+  fh1_resolve_guest_refresh false -> true.
+
+MEASURED AFTER THE FLIP, ON DEFAULTS, NO ENVIRONMENT VARIABLES (BUILD_EXIT=0, 0 error: lines):
+
+| seed family | swap | presented texture bands (rows 0-720) |
+|---|---|---|
+| p3m3-trace.state | 340 | `1.000 x12`, mean 71.8 -> 107.8 |
+| p3m3-trace.state | 341 | `1.000 x12`, mean 71.7 -> 110.0 |
+| p3m3-trace.state | 342 | `1.000 x12`, mean 69.9 -> 110.0 |
+| fb1201-roam2.state | 340 | `1.000 x12`, mean 72.6 -> 106.0 |
+| fb1201-roam2.state | 341 | `1.000 x12`, mean 72.1 -> 108.4 |
+| fb1201-roam2.state | 342 | `1.000 x12`, mean 71.9 -> 109.7 |
+
+Every band including rows 0-59 is 1.000: no black band above row 360 on any of the six swaps, in
+both seed families, quoted from `stage=swap_texture` lines. `nonzero=1.0000` on every one. The
+presented image at swap 342 (viewed, `.local/diag/view-presented-342.png`) is the snow scene filling
+0..720. The user then ran the shipped build on their own display and saw the title screen, then the
+world filling the frame (snow, hills, trees, blue grade), then the controls card - no band.
+
+GATES on these defaults (verbatim):
+- `PASS d3d11-draws (gate-draws-20261113): draw_calls=50783, presented title frame; captures
+  draws-frame [0-255]`, GATE_EXIT=0.
+- `PASS d3d11-texture-uploads (gate-d3d11-texture-uploads-20261113): draw_calls=51007, uploads 24000
+  over 1049 frames (22.88/frame); captures cleared-frame [0-255]`, GATE_EXIT=0.
+- **FAIL d3d11-cleared-frames: present cadence 14.85 Hz below 30.0**, GATE_EXIT=1 - the refresh path
+  waits for the GPU and reads the range back per texture load (the 181 ms/load cost recorded in
+  PHASE 9). This is the price of presenting real frames and it is now a gate failure, stated plainly.
+- **FAIL d3d11-native-resolve-path: no resolve tally in the runtime log**, GATE_EXIT=1 - the run
+  produced no shutdown tally line for this gate to read (the run ends on the scenario's own timer),
+  so the gate has no evidence rather than a wrong number.
+
+BASELINE CHANGE, STATED EXPLICITLY: `trace-short` on defaults no longer reproduces
+`b8f68e89c6192577747ab452aa5598ef`. It now yields **`bdbf372199a1b862e4a164fe9ff5c8d8`** (t0300) and
+**`ea61676d771c30b1d12571fccde41298`** (t0600), means 5.539 and 0.467 instead of the notice's 33.453.
+The reason is the change itself: the default path used to present the CPU's frozen boot frame (the
+legal notice) and now presents the game's own frames, which at those wall-clock marks are the dark
+boot/title frames. The old md5 was a checksum of the frozen notice, not of rendered output; it is
+not re-recorded silently - it is superseded, with this reason.
+
+LIMIT NOT PAPERED OVER: the per-run good/bad split measured in PHASE 17 (same seed, same swap,
+some runs entirely black-topped with the trio forced on) is NOT explained by this change - it was
+observed with all three gates already on. What is proven is that the shipped default path no longer
+presents the frozen notice and no longer shows the band on six measured swaps plus live play. What
+is not proven is that a cold run can never again land on a partially-landed scene texture; the
+refresh path is what makes that unlikely and the cadence gate is what it costs.
+
 ## PHASE 17 — 2026-11-12: THE DRAW-DIFF RAN. THE HALF DRAW IS ISSUED AND WRITES BLACK; THE FAULT IS THE SAMPLE, NOT THE DRAW. BAND NOT FIXED.
 
 TOOL ADDED (default-off, probe-only): the existing `fh1_debug_c2_probe` now also logs `after=` —
