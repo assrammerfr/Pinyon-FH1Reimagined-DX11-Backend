@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <cfloat>
+#include <chrono>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -35,6 +36,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/ui/d3d11/d3d11_api.h>
 
 namespace rex::graphics::d3d11 {
@@ -556,6 +558,20 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     return false;
   }
 
+  // Stutter probe: split this load's CPU time into the resolve readback+land,
+  // the guest->scratch copy, the CPU untile (incl. the presented-upload
+  // channel swap), and the upload issue, so the perf CSV shows which
+  // sub-step dominates the ~206 ms spike frames.
+  int64_t reload_refresh_ns = 0;
+  int64_t reload_copy_ns = 0;
+  int64_t reload_untile_ns = 0;
+  int64_t reload_upload_ns = 0;
+  auto reload_ns_since = [](std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+  };
+
   // Make the guest spans CPU-authoritative (the same spans
   // CommitPreparedTextureLoad made resident) - rejects the load if any page
   // was GPU-written (a resolve source), which the base defers to be reloaded
@@ -588,6 +604,7 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   // resolved and then samples - the 3D scene, most visibly - would never be
   // uploaded.
   if (REXCVAR_GET(fh1_resolve_guest_refresh)) {
+    const auto refresh_start = std::chrono::steady_clock::now();
     if (load_base) {
       command_processor_.RefreshResolvedGuestRange(uint32_t(key.base_page) << 12,
                                                    d3d11_texture.GetGuestBaseSize());
@@ -596,26 +613,31 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       command_processor_.RefreshResolvedGuestRange(uint32_t(key.mip_page) << 12,
                                                    d3d11_texture.GetGuestMipsSize());
     }
+    reload_refresh_ns += reload_ns_since(refresh_start);
   }
-  if (load_base) {
-    const uint32_t base_addr = uint32_t(key.base_page) << 12;
-    const uint32_t base_size = d3d11_texture.GetGuestBaseSize();
-    load_scratch_base_.resize(base_size);
-    if (!shared_memory().CopyCpuRange(base_addr,
-                                      std::span<uint8_t>(load_scratch_base_.data(), base_size))) {
-      log_rejected_load("base", base_addr, base_size);
-      return false;
+  {
+    const auto copy_start = std::chrono::steady_clock::now();
+    if (load_base) {
+      const uint32_t base_addr = uint32_t(key.base_page) << 12;
+      const uint32_t base_size = d3d11_texture.GetGuestBaseSize();
+      load_scratch_base_.resize(base_size);
+      if (!shared_memory().CopyCpuRange(base_addr, std::span<uint8_t>(load_scratch_base_.data(),
+                                                                      base_size))) {
+        log_rejected_load("base", base_addr, base_size);
+        return false;
+      }
     }
-  }
-  if (load_mips) {
-    const uint32_t mips_addr = uint32_t(key.mip_page) << 12;
-    const uint32_t mips_size = d3d11_texture.GetGuestMipsSize();
-    load_scratch_mips_.resize(mips_size);
-    if (!shared_memory().CopyCpuRange(mips_addr,
-                                      std::span<uint8_t>(load_scratch_mips_.data(), mips_size))) {
-      log_rejected_load("mips", mips_addr, mips_size);
-      return false;
+    if (load_mips) {
+      const uint32_t mips_addr = uint32_t(key.mip_page) << 12;
+      const uint32_t mips_size = d3d11_texture.GetGuestMipsSize();
+      load_scratch_mips_.resize(mips_size);
+      if (!shared_memory().CopyCpuRange(mips_addr, std::span<uint8_t>(load_scratch_mips_.data(),
+                                                                      mips_size))) {
+        log_rejected_load("mips", mips_addr, mips_size);
+        return false;
+      }
     }
+    reload_copy_ns += reload_ns_since(copy_start);
   }
 
   // Level addressing mirrors the Direct3D 12 load shader dispatch: the base
@@ -678,6 +700,7 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
       slice_info.destination_block_row_bytes = host_format.convert_block_row_bytes;
       slice_info.endian = key.endianness;
       slice_info.convert = host_format.convert;
+      const auto untile_start = std::chrono::steady_clock::now();
       texture_conversion::CopyGuestLevelSlice(slice_info);
 
       // The guest asks the resolve that writes its front buffer to exchange red
@@ -709,18 +732,21 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
                         ((value >> 20) & 0x000003FFu) | (value & 0xC0000000u);
         }
       }
+      reload_untile_ns += reload_ns_since(untile_start);
 
       // Phase 3 M3: while a draw's RequestTextures is running, the upload is a
       // packet on the command tape - the CPU untiling above still happens here,
       // the GPU write happens at replay, before the draw that samples it. The
       // swap's upload (and any load outside a draw) stays immediate.
       const uint32_t destination_subresource = level + slice * level_count;
+      const auto upload_start = std::chrono::steady_clock::now();
       if (!command_processor_.RecordTextureUpload(
               d3d11_texture.resource(), destination_subresource, staging_.data(),
               slice_pitch_bytes, row_pitch_bytes, slice_pitch_bytes)) {
         context->UpdateSubresource(d3d11_texture.resource(), destination_subresource, nullptr,
                                    staging_.data(), row_pitch_bytes, slice_pitch_bytes);
       }
+      reload_upload_ns += reload_ns_since(upload_start);
       uploaded_bytes += slice_pitch_bytes;
     }
   }
@@ -741,6 +767,10 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     REXGPU_INFO("D3D11 texture cache: uploaded {} textures ({} KB)", texture_upload_count_,
                 texture_upload_bytes_ / 1024);
   }
+  PERF_counter_add(kTextureReloadRefreshNs, reload_refresh_ns);
+  PERF_counter_add(kTextureReloadCopyNs, reload_copy_ns);
+  PERF_counter_add(kTextureReloadUntileNs, reload_untile_ns);
+  PERF_counter_add(kTextureReloadUploadNs, reload_upload_ns);
   return true;
 }
 
