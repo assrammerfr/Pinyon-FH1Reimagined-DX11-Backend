@@ -45,14 +45,27 @@ its own host texture.
   on the GTX 570.
 - **Phase 2 gate — PASS.** 4,122 frames / 70 s, 17,000 texture uploads,
   0 failures.
-- **Current — Phase 17.** The game runs and the world renders (road,
-  trees, animals, headlights), but the presented frame still carries a
-  strong blue colour cast and horizontal banding/shearing, and a black band
-  above row 360 shows up on some runs — runs are wholly good or wholly bad.
-  The Phase 17 draw-diff proved the half draw *is* issued with the right
-  rectangle and paints its half black, so the fault is in the sample, not
-  the draw. Not fixed; the acceptance criterion (no band above row 360
-  across two seeds and repeated swaps) is not met.
+- **Colour fix — DONE.** The R↔B channel swap is fixed (upload-side swap
+  restored in `texture_cache.cpp`). The neon blue cast is gone — frames are
+  warm/red. Still needs a clean "good run" for a definitive sunset-gold
+  proof (every free-roam run so far was a bad run with the black band).
+- **Optimization — DONE.** Median free-roam 9.0 → 13.8–15.4 FPS (+53–71%)
+  by skipping the GPU wait + readback per texture load when no new resolve
+  landed since the last refresh.
+- **Stutter fix — DONE.** Spike untile halved (75.5 → 37 ms) via a fast
+  path in `CopyGuestLevelSlice` that computes the block offset once per run
+  instead of once per block. p95 274 → 232–235 ms, p99 333–384 → 276–291 ms,
+  median 16.1–18.8 FPS. Stutter reduced but not eliminated — p95 is still
+  ~233 ms vs 33 ms needed for 30 FPS.
+- **Refresh fix — IN PROGRESS.** The remaining stutter is the refresh
+  (~117 ms in spike frames: GPU waits ~73 ms + readback ~43 ms). Fix: batch
+  the refreshes into 2–3 waits, defer the readback via the copy engine with
+  double-buffered staging, and only refresh ranges that actually changed
+  (dirty tracking).
+- **Current.** The game runs and the world renders (road, trees, animals,
+  headlights). A black band above row 360 still shows up on some runs —
+  runs are wholly good or wholly bad. The acceptance criterion (no band
+  above row 360 across two seeds and repeated swaps) is not met.
 - **Baseline:** `trace-short` on defaults reproduces md5
   `b8f68e89c6192577747ab452aa5598ef` on both captures. If that hash moves,
   the default path changed.
@@ -100,8 +113,9 @@ exits 0.
 - **Multisampled depth cannot be read back on D3D11.** Staging cannot
   take MSAA and `ResolveSubresource` has no depth support. That is an open
   instrument gap.
-- **The black band / blue cast.** See Status above. The upload/untile leg
-  is excluded (paired same-swap captures are band-for-band identical), and
-  late composite draws are excluded too — the top half is simply produced
-  only on some swaps. The next experiment is a guest probe comparing guest
-  and mirror bytes of the sampled texture in a known-good vs known-bad run.
+- **The black band.** Still intermittent on bad runs (above row 360). See
+  Status above. The upload/untile leg is excluded (paired same-swap
+  captures are band-for-band identical), and late composite draws are
+  excluded too — the top half is simply produced only on some swaps. The
+  next experiment is a guest probe comparing guest and mirror bytes of the
+  sampled texture in a known-good vs known-bad run.
